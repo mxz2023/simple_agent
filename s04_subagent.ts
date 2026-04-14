@@ -14,20 +14,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as dotenv from "dotenv";
-import Anthropic from "@anthropic-ai/sdk";
-import type { MessageParam, Tool } from "@anthropic-ai/sdk/resources/messages";
+import { callChatCompletion, convertTools, hasToolCalls, getToolCallArgs, type Message, type Tool } from "./lib/openai-client";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL ?? undefined,
-});
 const MODEL = process.env.MODEL_ID!;
 
 const SYSTEM = `You are a coding agent at ${WORKDIR}. Use the task tool to delegate exploration or subtasks.`;
@@ -144,7 +135,7 @@ const TOOL_HANDLERS: Record<string, (input: Record<string, unknown>) => string> 
   edit_file: (kw) => runEdit(String(kw.path), String(kw.old_text), String(kw.new_text)),
 };
 
-const CHILD_TOOLS: Tool[] = [
+const CHILD_TOOLS_DEF = [
   {
     name: "bash",
     description: "Run a shell command.",
@@ -187,45 +178,57 @@ const CHILD_TOOLS: Tool[] = [
   },
 ];
 
-async function runSubagent(prompt: string): Promise<string> {
-  const subMessages: MessageParam[] = [{ role: "user", content: prompt }];
-  let response!: Anthropic.Messages.Message;
-  for (let i = 0; i < 30; i++) {
-    response = await client.messages.create({
-      model: MODEL,
-      system: SUBAGENT_SYSTEM,
-      messages: subMessages,
-      tools: CHILD_TOOLS,
-      max_tokens: 8000,
-    });
-    subMessages.push({ role: "assistant", content: response.content });
-    if (response.stop_reason !== "tool_use") break;
+const CHILD_TOOLS = convertTools(CHILD_TOOLS_DEF);
 
-    const results: Anthropic.Messages.ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
-      const handler = TOOL_HANDLERS[block.name];
+async function runSubagent(prompt: string): Promise<string> {
+  const subMessages: Message[] = [{ role: "user", content: prompt }];
+  let response!: { content: string | unknown[] };
+
+  for (let i = 0; i < 30; i++) {
+    response = await callChatCompletion(subMessages, CHILD_TOOLS, SUBAGENT_SYSTEM);
+
+    // 将工具调用转换为消息
+    if (Array.isArray(response.content)) {
+      subMessages.push({ role: "assistant", content: JSON.stringify(response.content) });
+    } else {
+      subMessages.push({ role: "assistant", content: response.content });
+    }
+
+    if (!hasToolCalls(response)) break;
+
+    const toolCalls = response.content as Array<{ id: string; function: { name: string; arguments: string } }>;
+    const results: Message[] = [];
+
+    for (const call of toolCalls) {
+      const handler = TOOL_HANDLERS[call.function.name];
       const out = handler
-        ? handler((block.input ?? {}) as Record<string, unknown>)
-        : `Unknown tool: ${block.name}`;
+        ? handler(getToolCallArgs(call))
+        : `Unknown tool: ${call.function.name}`;
       results.push({
-        type: "tool_result",
-        tool_use_id: block.id,
+        role: "tool",
+        tool_call_id: call.id,
         content: String(out).slice(0, 50_000),
       });
     }
-    subMessages.push({ role: "user", content: results });
+    subMessages.push(...results);
+  }
+
+  // 提取文本回复
+  if (typeof response.content === "string") {
+    return response.content || "(no summary)";
   }
 
   const parts: string[] = [];
-  for (const block of response.content) {
-    if (block.type === "text") parts.push(block.text);
+  if (Array.isArray(response.content)) {
+    for (const block of response.content as Array<{ text?: string }>) {
+      if (block.text) parts.push(block.text);
+    }
   }
   return parts.join("") || "(no summary)";
 }
 
-const PARENT_TOOLS: Tool[] = [
-  ...CHILD_TOOLS,
+const PARENT_TOOLS = convertTools([
+  ...CHILD_TOOLS_DEF,
   {
     name: "task",
     description:
@@ -239,45 +242,47 @@ const PARENT_TOOLS: Tool[] = [
       required: ["prompt"],
     },
   },
-];
+]);
 
-async function agentLoop(messages: MessageParam[]): Promise<void> {
+async function agentLoop(messages: Message[]): Promise<void> {
   while (true) {
-    const response = await client.messages.create({
-      model: MODEL,
-      system: SYSTEM,
-      messages,
-      tools: PARENT_TOOLS,
-      max_tokens: 8000,
-    });
-    messages.push({ role: "assistant", content: response.content });
-    if (response.stop_reason !== "tool_use") return;
+    const response = await callChatCompletion(messages, PARENT_TOOLS, SYSTEM);
 
-    const results: Anthropic.Messages.ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
+    // 将工具调用转换为消息
+    if (Array.isArray(response.content)) {
+      messages.push({ role: "assistant", content: JSON.stringify(response.content) });
+    } else {
+      messages.push({ role: "assistant", content: response.content });
+    }
+
+    if (!hasToolCalls(response)) return;
+
+    const toolCalls = response.content as Array<{ id: string; function: { name: string; arguments: string } }>;
+    const results: Message[] = [];
+
+    for (const call of toolCalls) {
       let out: string;
-      if (block.name === "task") {
-        const input = (block.input ?? {}) as Record<string, unknown>;
+      if (call.function.name === "task") {
+        const input = getToolCallArgs(call);
         const desc = String(input.description ?? "subtask");
         const pr = String(input.prompt ?? "");
         console.log(`> task (${desc}): ${pr.slice(0, 80)}`);
         out = await runSubagent(pr);
       } else {
-        const handler = TOOL_HANDLERS[block.name];
+        const handler = TOOL_HANDLERS[call.function.name];
         out = handler
-          ? handler((block.input ?? {}) as Record<string, unknown>)
-          : `Unknown tool: ${block.name}`;
+          ? handler(getToolCallArgs(call))
+          : `Unknown tool: ${call.function.name}`;
       }
       console.log(`  ${out.slice(0, 200)}`);
-      results.push({ type: "tool_result", tool_use_id: block.id, content: String(out) });
+      results.push({ role: "tool", tool_call_id: call.id, content: String(out) });
     }
-    messages.push({ role: "user", content: results });
+    messages.push(...results);
   }
 }
 
 async function main(): Promise<void> {
-  const history: MessageParam[] = [];
+  const history: Message[] = [];
   const rl = readline.createInterface({ input, output });
   try {
     while (true) {

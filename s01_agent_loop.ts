@@ -21,24 +21,16 @@ import { execSync } from "node:child_process";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as dotenv from "dotenv";
-import Anthropic from "@anthropic-ai/sdk";
-import type { MessageParam, Tool } from "@anthropic-ai/sdk/resources/messages";
+import { callChatCompletion, convertTools, hasToolCalls, getToolCallArgs, type Message, type Tool } from "./lib/openai-client";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL ?? undefined,
-});
+const WORKDIR = process.cwd();
 const MODEL = process.env.MODEL_ID!;
 
-const SYSTEM = `You are a coding agent at ${process.cwd()}. Use bash to inspect and change the workspace. Act first, then report clearly.`;
+const SYSTEM = `You are a coding agent at ${WORKDIR}. Use bash to inspect and change the workspace. Act first, then report clearly.`;
 
-const TOOLS: Tool[] = [
+const TOOLS = convertTools([
   {
     name: "bash",
     description: "Run a shell command in the current workspace.",
@@ -48,10 +40,10 @@ const TOOLS: Tool[] = [
       required: ["command"],
     },
   },
-];
+]);
 
 interface LoopState {
-  messages: MessageParam[];
+  messages: Message[];
   turnCount: number;
   transitionReason: string | null;
 }
@@ -64,7 +56,7 @@ function runBash(command: string): string {
   try {
     const result = execSync(command, {
       shell: "/bin/sh",
-      cwd: process.cwd(),
+      cwd: WORKDIR,
       encoding: "utf8",
       timeout: 120_000,
       maxBuffer: 50_000_000,
@@ -82,6 +74,7 @@ function runBash(command: string): string {
 }
 
 function extractText(content: unknown): string {
+  if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   const texts: string[] = [];
   for (const block of content as { text?: string }[]) {
@@ -93,18 +86,21 @@ function extractText(content: unknown): string {
 }
 
 async function executeToolCalls(
-  responseContent: readonly Anthropic.Messages.ContentBlock[],
-): Promise<Anthropic.Messages.ToolResultBlockParam[]> {
-  const results: Anthropic.Messages.ToolResultBlockParam[] = [];
-  for (const block of responseContent) {
-    if (block.type !== "tool_use") continue;
-    const command = (block.input as { command: string }).command;
+  responseContent: unknown[],
+): Promise<Message[]> {
+  const results: Message[] = [];
+  for (const item of responseContent) {
+    const toolCall = item as { id?: string; function?: { name?: string; arguments?: string } };
+    if (!toolCall.function?.name || toolCall.function.name !== "bash") continue;
+
+    const args = getToolCallArgs(toolCall);
+    const command = String(args.command ?? "");
     console.log(`\x1b[33m$ ${command}\x1b[0m`);
     const out = runBash(command);
     console.log(out.slice(0, 200));
     results.push({
-      type: "tool_result",
-      tool_use_id: block.id,
+      role: "tool",
+      tool_call_id: toolCall.id,
       content: out,
     });
   }
@@ -112,27 +108,28 @@ async function executeToolCalls(
 }
 
 async function runOneTurn(state: LoopState): Promise<boolean> {
-  const response = await client.messages.create({
-    model: MODEL,
-    system: SYSTEM,
-    messages: state.messages,
-    tools: TOOLS,
-    max_tokens: 8000,
-  });
-  state.messages.push({ role: "assistant", content: response.content });
+  const response = await callChatCompletion(state.messages, TOOLS, SYSTEM);
 
-  if (response.stop_reason !== "tool_use") {
+  // 将工具调用转换为消息
+  if (Array.isArray(response.content)) {
+    state.messages.push({ role: "assistant", content: JSON.stringify(response.content) });
+  } else {
+    state.messages.push({ role: "assistant", content: response.content });
+  }
+
+  if (!hasToolCalls(response)) {
     state.transitionReason = null;
     return false;
   }
 
-  const results = await executeToolCalls(response.content);
-  if (!results.length) {
+  const toolCalls = response.content as Array<{ id: string; function: { name: string; arguments: string } }>;
+  const toolResults = await executeToolCalls(toolCalls);
+  if (!toolResults.length) {
     state.transitionReason = null;
     return false;
   }
 
-  state.messages.push({ role: "user", content: results });
+  state.messages.push(...toolResults);
   state.turnCount += 1;
   state.transitionReason = "tool_result";
   return true;
@@ -145,7 +142,7 @@ async function agentLoop(state: LoopState): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const history: MessageParam[] = [];
+  const history: Message[] = [];
   const rl = readline.createInterface({ input, output });
   try {
     while (true) {
@@ -167,7 +164,7 @@ async function main(): Promise<void> {
       await agentLoop(state);
 
       const last = history[history.length - 1];
-      const finalText = extractText(last?.content);
+      const finalText = last ? extractText(last.content) : "";
       if (finalText) console.log(finalText);
       console.log();
     }

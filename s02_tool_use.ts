@@ -17,20 +17,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as dotenv from "dotenv";
-import Anthropic from "@anthropic-ai/sdk";
-import type { MessageParam, Tool } from "@anthropic-ai/sdk/resources/messages";
+import { callChatCompletion, convertTools, hasToolCalls, getToolCallArgs, type Message, type Tool } from "./lib/openai-client";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL ?? undefined,
-});
 const MODEL = process.env.MODEL_ID!;
 
 const SYSTEM = `You are a coding agent at ${WORKDIR}. Use tools to solve tasks. Act, don't explain.`;
@@ -108,9 +99,6 @@ function runEdit(filePath: string, oldText: string, newText: string): string {
   }
 }
 
-const CONCURRENCY_SAFE = new Set(["read_file"]);
-const CONCURRENCY_UNSAFE = new Set(["write_file", "edit_file"]);
-
 const TOOL_HANDLERS: Record<string, (input: Record<string, unknown>) => string> = {
   bash: (kw) => runBash(String(kw.command)),
   read_file: (kw) => runRead(String(kw.path), kw.limit as number | undefined),
@@ -118,7 +106,7 @@ const TOOL_HANDLERS: Record<string, (input: Record<string, unknown>) => string> 
   edit_file: (kw) => runEdit(String(kw.path), String(kw.old_text), String(kw.new_text)),
 };
 
-const TOOLS: Tool[] = [
+const TOOLS_DEF = [
   {
     name: "bash",
     description: "Run a shell command.",
@@ -161,75 +149,24 @@ const TOOLS: Tool[] = [
   },
 ];
 
-type ContentBlockDict = Record<string, unknown>;
+const TOOLS = convertTools(TOOLS_DEF);
 
-function normalizeMessages(messages: MessageParam[]): MessageParam[] {
-  const cleaned: MessageParam[] = [];
+function normalizeMessages(messages: Message[]): Message[] {
+  const cleaned: Message[] = [];
   for (const msg of messages) {
-    const clean = { role: msg.role } as MessageParam;
-    const c = msg.content;
-    if (typeof c === "string") {
-      clean.content = c;
-    } else if (Array.isArray(c)) {
-      clean.content = c
-        .filter((block) => typeof block === "object" && block !== null)
-        .map((block) => {
-          const o: ContentBlockDict = {};
-          for (const [k, v] of Object.entries(block as unknown as Record<string, unknown>)) {
-            if (!k.startsWith("_")) o[k] = v;
-          }
-          return o as unknown as Anthropic.Messages.ContentBlockParam;
-        });
-    } else {
-      clean.content = (c as string | undefined) ?? "";
-    }
+    const clean: Message = { role: msg.role as Message["role"], content: msg.content };
     cleaned.push(clean);
   }
 
-  const existingResults = new Set<string>();
-  for (const msg of cleaned) {
-    const content = msg.content;
-    if (Array.isArray(content)) {
-      for (const block of content) {
-        const b = block as unknown as ContentBlockDict;
-        if (b.type === "tool_result") {
-          existingResults.add(String(b.tool_use_id));
-        }
-      }
-    }
-  }
-
-  for (const msg of cleaned) {
-    if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
-    for (const block of msg.content) {
-      const b = block as unknown as ContentBlockDict;
-      if (b.type === "tool_use" && !existingResults.has(String(b.id))) {
-        cleaned.push({
-          role: "user",
-          content: [
-            {
-              type: "tool_result",
-              tool_use_id: String(b.id),
-              content: "(cancelled)",
-            },
-          ],
-        });
-      }
-    }
-  }
-
+  // 合并连续的同角色消息
   if (!cleaned.length) return cleaned;
-  const merged: MessageParam[] = [cleaned[0]!];
+  const merged: Message[] = [cleaned[0]!];
   for (const msg of cleaned.slice(1)) {
     const prev = merged[merged.length - 1]!;
     if (msg.role === prev.role) {
-      const prevC = Array.isArray(prev.content)
-        ? prev.content
-        : [{ type: "text" as const, text: String(prev.content) }];
-      const currC = Array.isArray(msg.content)
-        ? msg.content
-        : [{ type: "text" as const, text: String(msg.content) }];
-      prev.content = [...prevC, ...currC];
+      const prevText = typeof prev.content === "string" ? prev.content : JSON.stringify(prev.content);
+      const currText = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+      prev.content = prevText + "\n" + currText;
     } else {
       merged.push(msg);
     }
@@ -237,34 +174,33 @@ function normalizeMessages(messages: MessageParam[]): MessageParam[] {
   return merged;
 }
 
-async function agentLoop(messages: MessageParam[]): Promise<void> {
+async function agentLoop(messages: Message[]): Promise<void> {
   while (true) {
-    const response = await client.messages.create({
-      model: MODEL,
-      system: SYSTEM,
-      messages: normalizeMessages(messages),
-      tools: TOOLS,
-      max_tokens: 8000,
-    });
-    messages.push({ role: "assistant", content: response.content });
-    if (response.stop_reason !== "tool_use") return;
+    const response = await callChatCompletion(normalizeMessages(messages), TOOLS, SYSTEM);
 
-    const results: Anthropic.Messages.ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
-      const handler = TOOL_HANDLERS[block.name];
-      const input = (block.input ?? {}) as Record<string, unknown>;
-      const out = handler ? handler(input) : `Unknown tool: ${block.name}`;
-      console.log(`> ${block.name}:`);
-      console.log(out.slice(0, 200));
-      results.push({ type: "tool_result", tool_use_id: block.id, content: out });
+    // 将工具调用转换为消息
+    if (Array.isArray(response.content)) {
+      messages.push({ role: "assistant", content: JSON.stringify(response.content) });
+    } else {
+      messages.push({ role: "assistant", content: response.content });
     }
-    messages.push({ role: "user", content: results });
+
+    if (!hasToolCalls(response)) return;
+
+    const toolCalls = response.content as typeof response.content extends Array<infer T> ? T : never;
+    for (const call of toolCalls as Array<{ id: string; function: { name: string; arguments: string } }>) {
+      const handler = TOOL_HANDLERS[call.function.name];
+      const input = getToolCallArgs(call);
+      const out = handler ? handler(input) : `Unknown tool: ${call.function.name}`;
+      console.log(`> ${call.function.name}:`);
+      console.log(out.slice(0, 200));
+      messages.push({ role: "tool", tool_call_id: call.id, content: out });
+    }
   }
 }
 
 async function main(): Promise<void> {
-  const history: MessageParam[] = [];
+  const history: Message[] = [];
   const rl = readline.createInterface({ input, output });
   try {
     while (true) {
@@ -278,13 +214,11 @@ async function main(): Promise<void> {
       if (q === "q" || q === "exit" || q === "") break;
       history.push({ role: "user", content: query });
       await agentLoop(history);
-      const responseContent = history[history.length - 1]?.content;
-      if (Array.isArray(responseContent)) {
-        for (const block of responseContent) {
-          if ("text" in block && typeof (block as { text?: string }).text === "string") {
-            console.log((block as { text: string }).text);
-          }
-        }
+
+      // 输出最后回复
+      const lastMsg = history[history.length - 1];
+      if (lastMsg && typeof lastMsg.content === "string") {
+        console.log(lastMsg.content);
       }
       console.log();
     }

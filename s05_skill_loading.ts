@@ -16,20 +16,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as dotenv from "dotenv";
-import Anthropic from "@anthropic-ai/sdk";
-import type { MessageParam, Tool } from "@anthropic-ai/sdk/resources/messages";
+import { callChatCompletion, convertTools, hasToolCalls, getToolCallArgs, type Message, type Tool } from "./lib/openai-client";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL ?? undefined,
-});
 const MODEL = process.env.MODEL_ID!;
 const SKILLS_DIR = path.join(WORKDIR, "skills");
 
@@ -204,7 +195,7 @@ const TOOL_HANDLERS: Record<string, (input: Record<string, unknown>) => string> 
   load_skill: (kw) => SKILL_REGISTRY.loadFullText(String(kw.name)),
 };
 
-const TOOLS: Tool[] = [
+const TOOLS = convertTools([
   {
     name: "bash",
     description: "Run a shell command.",
@@ -254,9 +245,10 @@ const TOOLS: Tool[] = [
       required: ["name"],
     },
   },
-];
+]);
 
 function extractText(content: unknown): string {
+  if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   const texts: string[] = [];
   for (const block of content as { text?: string }[]) {
@@ -265,41 +257,41 @@ function extractText(content: unknown): string {
   return texts.join("\n").trim();
 }
 
-async function agentLoop(messages: MessageParam[]): Promise<void> {
+async function agentLoop(messages: Message[]): Promise<void> {
   while (true) {
-    const response = await client.messages.create({
-      model: MODEL,
-      system: SYSTEM,
-      messages,
-      tools: TOOLS,
-      max_tokens: 8000,
-    });
-    messages.push({ role: "assistant", content: response.content });
+    const response = await callChatCompletion(messages, TOOLS, SYSTEM);
 
-    if (response.stop_reason !== "tool_use") return;
+    // 将工具调用转换为消息
+    if (Array.isArray(response.content)) {
+      messages.push({ role: "assistant", content: JSON.stringify(response.content) });
+    } else {
+      messages.push({ role: "assistant", content: response.content });
+    }
 
-    const results: Anthropic.Messages.ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
+    if (!hasToolCalls(response)) return;
 
-      const handler = TOOL_HANDLERS[block.name];
+    const toolCalls = response.content as typeof response.content extends Array<infer T> ? T : never;
+    const results: Message[] = [];
+
+    for (const call of toolCalls as Array<{ id: string; function: { name: string; arguments: string } }>) {
+      const handler = TOOL_HANDLERS[call.function.name];
       let out: string;
       try {
-        out = handler ? handler((block.input ?? {}) as Record<string, unknown>) : `Unknown tool: ${block.name}`;
+        out = handler ? handler(getToolCallArgs(call)) : `Unknown tool: ${call.function.name}`;
       } catch (exc) {
         out = `Error: ${exc}`;
       }
 
-      console.log(`> ${block.name}: ${out.slice(0, 200)}`);
-      results.push({ type: "tool_result", tool_use_id: block.id, content: out });
+      console.log(`> ${call.function.name}: ${out.slice(0, 200)}`);
+      results.push({ role: "tool", tool_call_id: call.id, content: out });
     }
 
-    messages.push({ role: "user", content: results });
+    messages.push(...results);
   }
 }
 
 async function main(): Promise<void> {
-  const history: MessageParam[] = [];
+  const history: Message[] = [];
   const rl = readline.createInterface({ input, output });
   try {
     while (true) {

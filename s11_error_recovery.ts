@@ -11,20 +11,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as dotenv from "dotenv";
-import Anthropic, { APIError } from "@anthropic-ai/sdk";
-import type { MessageParam, Tool } from "@anthropic-ai/sdk/resources/messages";
+import { callChatCompletion, convertTools, hasToolCalls, getToolCallArgs, type Message, type Tool } from "./lib/openai-client";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL ?? undefined,
-});
 const MODEL = process.env.MODEL_ID!;
 
 const MAX_RECOVERY_ATTEMPTS = 3;
@@ -40,11 +31,11 @@ function jsonStringifySafe(value: unknown): string {
   return JSON.stringify(value, (_, v) => (typeof v === "bigint" ? v.toString() : v));
 }
 
-function estimateTokens(messages: MessageParam[]): number {
+function estimateTokens(messages: Message[]): number {
   return Math.floor(jsonStringifySafe(messages).length / 4);
 }
 
-async function autoCompact(messages: MessageParam[]): Promise<MessageParam[]> {
+async function autoCompact(messages: Message[]): Promise<Message[]> {
   const conversationText = jsonStringifySafe(messages).slice(0, 80_000);
   const prompt =
     "Summarize this conversation for continuity. Include:\n" +
@@ -56,13 +47,8 @@ async function autoCompact(messages: MessageParam[]): Promise<MessageParam[]> {
     conversationText;
   let summary: string;
   try {
-    const response = await client.messages.create({
-      model: MODEL,
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 4000,
-    });
-    const first = response.content[0];
-    summary = first && first.type === "text" ? first.text : "";
+    const response = await callChatCompletion([{ role: "user", content: prompt }], undefined, undefined);
+    summary = String(response.content);
   } catch (e) {
     summary = `(compact failed: ${e}). Previous context lost.`;
   }
@@ -163,7 +149,7 @@ const TOOL_HANDLERS: Record<string, (input: Record<string, unknown>) => string> 
   edit_file: (kw) => runEdit(String(kw.path), String(kw.old_text), String(kw.new_text)),
 };
 
-const TOOLS: Tool[] = [
+const TOOLS = convertTools([
   {
     name: "bash",
     description: "Run a shell command.",
@@ -204,7 +190,7 @@ const TOOLS: Tool[] = [
       required: ["path", "old_text", "new_text"],
     },
   },
-];
+]);
 
 const SYSTEM = `You are a coding agent at ${WORKDIR}. Use tools to solve tasks.`;
 
@@ -221,60 +207,35 @@ function isRetriableTransportError(e: unknown): boolean {
   );
 }
 
-async function agentLoop(messages: MessageParam[]): Promise<void> {
+async function agentLoop(messages: Message[]): Promise<void> {
   let maxOutputRecoveryCount = 0;
 
   while (true) {
-    let response: Anthropic.Messages.Message | null = null;
+    let response: { content: string | unknown[]; stop_reason: string | null } | null = null;
 
     for (let attempt = 0; attempt <= MAX_RECOVERY_ATTEMPTS; attempt++) {
       try {
-        response = await client.messages.create({
-          model: MODEL,
-          system: SYSTEM,
-          messages,
-          tools: TOOLS,
-          max_tokens: 8000,
-        });
+        response = await callChatCompletion(messages, TOOLS, SYSTEM);
         break;
       } catch (e: unknown) {
         const errorBody = String(e).toLowerCase();
 
-        if (e instanceof APIError || (e as { status?: number })?.status) {
-          if (errorBody.includes("overlong_prompt") || (errorBody.includes("prompt") && errorBody.includes("long"))) {
-            console.log(`[Recovery] Prompt too long. Compacting... (attempt ${attempt + 1})`);
-            messages.splice(0, messages.length, ...(await autoCompact(messages)));
-            continue;
-          }
-
-          if (attempt < MAX_RECOVERY_ATTEMPTS) {
-            const delay = backoffDelay(attempt);
-            console.log(
-              `[Recovery] API error: ${String(e)}. Retrying in ${delay.toFixed(1)}s (attempt ${attempt + 1}/${MAX_RECOVERY_ATTEMPTS})`,
-            );
-            await sleepMs(delay * 1000);
-            continue;
-          }
-
-          console.log(`[Error] API call failed after ${MAX_RECOVERY_ATTEMPTS} retries: ${String(e)}`);
-          return;
+        if (errorBody.includes("overlong_prompt") || (errorBody.includes("prompt") && errorBody.includes("long"))) {
+          console.log(`[Recovery] Prompt too long. Compacting... (attempt ${attempt + 1})`);
+          messages.splice(0, messages.length, ...(await autoCompact(messages)));
+          continue;
         }
 
-        if (isRetriableTransportError(e)) {
-          if (attempt < MAX_RECOVERY_ATTEMPTS) {
-            const delay = backoffDelay(attempt);
-            console.log(
-              `[Recovery] Connection error: ${String(e)}. Retrying in ${delay.toFixed(1)}s (attempt ${attempt + 1}/${MAX_RECOVERY_ATTEMPTS})`,
-            );
-            await sleepMs(delay * 1000);
-            continue;
-          }
-
-          console.log(`[Error] Connection failed after ${MAX_RECOVERY_ATTEMPTS} retries: ${String(e)}`);
-          return;
+        if (attempt < MAX_RECOVERY_ATTEMPTS) {
+          const delay = backoffDelay(attempt);
+          console.log(
+            `[Recovery] API error: ${String(e)}. Retrying in ${delay.toFixed(1)}s (attempt ${attempt + 1}/${MAX_RECOVERY_ATTEMPTS})`,
+          );
+          await sleepMs(delay * 1000);
+          continue;
         }
 
-        console.log(`[Error] Unexpected error: ${String(e)}`);
+        console.log(`[Error] API call failed after ${MAX_RECOVERY_ATTEMPTS} retries: ${String(e)}`);
         return;
       }
     }
@@ -284,9 +245,14 @@ async function agentLoop(messages: MessageParam[]): Promise<void> {
       return;
     }
 
-    messages.push({ role: "assistant", content: response.content });
+    // 将工具调用转换为消息
+    if (Array.isArray(response.content)) {
+      messages.push({ role: "assistant", content: JSON.stringify(response.content) });
+    } else {
+      messages.push({ role: "assistant", content: response.content });
+    }
 
-    if (response.stop_reason === "max_tokens") {
+    if (response.stop_reason === "max_tokens" || response.stop_reason === "length") {
       maxOutputRecoveryCount += 1;
       if (maxOutputRecoveryCount <= MAX_RECOVERY_ATTEMPTS) {
         console.log(
@@ -301,25 +267,24 @@ async function agentLoop(messages: MessageParam[]): Promise<void> {
 
     maxOutputRecoveryCount = 0;
 
-    if (response.stop_reason !== "tool_use") return;
+    if (!hasToolCalls(response)) return;
 
-    const results: Anthropic.Messages.ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
-      const handler = TOOL_HANDLERS[block.name];
+    const toolCalls = response.content as Array<{ id: string; function: { name: string; arguments: string } }>;
+    const results: Message[] = [];
+
+    for (const call of toolCalls) {
+      const handler = TOOL_HANDLERS[call.function.name];
       let output: string;
       try {
-        output = handler
-          ? handler((block.input ?? {}) as Record<string, unknown>)
-          : `Unknown: ${block.name}`;
+        output = handler ? handler(getToolCallArgs(call)) : `Unknown: ${call.function.name}`;
       } catch (e) {
         output = `Error: ${e}`;
       }
-      console.log(`> ${block.name}: ${output.slice(0, 200)}`);
-      results.push({ type: "tool_result", tool_use_id: block.id, content: String(output) });
+      console.log(`> ${call.function.name}: ${output.slice(0, 200)}`);
+      results.push({ role: "tool", tool_call_id: call.id, content: String(output) });
     }
 
-    messages.push({ role: "user", content: results });
+    messages.push(...results);
 
     if (estimateTokens(messages) > TOKEN_THRESHOLD) {
       console.log("[Recovery] Token estimate exceeds threshold. Auto-compacting...");
@@ -330,7 +295,7 @@ async function agentLoop(messages: MessageParam[]): Promise<void> {
 
 async function main(): Promise<void> {
   console.log("[Error recovery enabled: max_tokens / prompt_too_long / connection backoff]");
-  const history: MessageParam[] = [];
+  const history: Message[] = [];
   const rl = readline.createInterface({ input, output });
   try {
     while (true) {

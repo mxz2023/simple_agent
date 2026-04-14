@@ -16,17 +16,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as dotenv from "dotenv";
-import Anthropic from "@anthropic-ai/sdk";
-import type { MessageParam, Tool } from "@anthropic-ai/sdk/resources/messages";
+import { callChatCompletion, convertTools, hasToolCalls, getToolCallArgs, type Message, type Tool } from "./lib/openai-client";
 
 dotenv.config({ override: true });
-if (process.env.ANTHROPIC_BASE_URL) delete process.env.ANTHROPIC_AUTH_TOKEN;
-
-const WORKDIR = process.cwd();
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL ?? undefined,
-});
 const MODEL = process.env.MODEL_ID!;
 
 const TEAM_DIR = path.join(WORKDIR, ".team");
@@ -258,27 +250,27 @@ async function runSubagent(prompt: string, agentType = "Explore"): Promise<strin
     write_file: (kw) => runWrite(String(kw.path), String(kw.content)),
     edit_file: (kw) => runEdit(String(kw.path), String(kw.old_text), String(kw.new_text)),
   };
-  const subMsgs: MessageParam[] = [{ role: "user", content: prompt }];
-  let resp: Awaited<ReturnType<typeof client.messages.create>> | null = null;
+  const subMsgs: Message[] = [{ role: "user", content: prompt }];
+  let resp: Awaited<ReturnType<typeof callChatCompletion>> | null = null;
   for (let i = 0; i < 30; i++) {
-    resp = await client.messages.create({ model: MODEL, messages: subMsgs, tools: subTools, max_tokens: 8000 });
+    resp = await callChatCompletion(subMsgs, subTools, "You are a subagent exploring or working on tasks.");
     subMsgs.push({ role: "assistant", content: resp.content });
-    if (resp.stop_reason !== "tool_use") break;
-    const results: Anthropic.Messages.ToolResultBlockParam[] = [];
-    for (const b of resp.content) {
-      if (b.type !== "tool_use") continue;
-      const h = subHandlers[b.name];
-      const out = h ? h((b.input ?? {}) as Record<string, unknown>) : "Unknown tool";
-      results.push({ type: "tool_result", tool_use_id: b.id, content: String(out).slice(0, 50_000) });
+    if (!hasToolCalls(resp)) break;
+    const toolCalls = resp.content as Array<{ id: string; function: { name: string; arguments: string } }>;
+    const results: Message[] = [];
+    for (const call of toolCalls) {
+      const h = subHandlers[call.function.name];
+      const out = h ? h(getToolCallArgs(call)) : "Unknown tool";
+      results.push({ role: "tool", tool_call_id: call.id, content: String(out).slice(0, 50_000) });
     }
-    subMsgs.push({ role: "user", content: results });
+    subMsgs.push(...results);
   }
   if (!resp) return "(subagent failed)";
-  const text = resp.content
-    .filter((b): b is Anthropic.Messages.TextBlock => b.type === "text")
-    .map((b) => b.text)
-    .join("");
-  return text || "(no summary)";
+  if (Array.isArray(resp.content)) {
+    const textBlocks = resp.content.filter((b): b is { type: "text"; text: string } => "type" in b && b.type === "text" && typeof b.text === "string");
+    return textBlocks.map((b) => b.text).join("") || "(no summary)";
+  }
+  return String(resp.content) || "(no summary)";
 }
 
 class SkillLoader {
@@ -326,41 +318,24 @@ class SkillLoader {
   }
 }
 
-function estimateTokens(messages: MessageParam[]): number {
+function estimateTokens(messages: Message[]): number {
   return Math.floor(jsonStringifySafe(messages).length / 4);
 }
 
-function microcompact(messages: MessageParam[]): void {
-  const toolResults: Array<{ block: { tool_use_id?: string; content?: unknown } }> = [];
+function microcompact(messages: Message[]): void {
+  const toolResults: Array<{ block: { tool_call_id?: string; content?: unknown } }> = [];
   for (const msg of messages) {
-    if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
-    for (const part of msg.content) {
-      if (typeof part === "object" && part && (part as { type?: string }).type === "tool_result") {
-        toolResults.push({ block: part as { tool_use_id?: string; content?: unknown } });
-      }
-    }
+    if (msg.role !== "tool") continue;
+    toolResults.push({ block: { tool_call_id: msg.tool_call_id, content: msg.content } });
   }
   if (toolResults.length <= KEEP_RECENT) return;
-  const toolNameMap: Record<string, string> = {};
-  for (const msg of messages) {
-    if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
-    for (const block of msg.content) {
-      if (typeof block === "object" && block && (block as { type?: string }).type === "tool_use") {
-        const b = block as { id: string; name: string };
-        toolNameMap[b.id] = b.name;
-      }
-    }
-  }
   for (const { block } of toolResults.slice(0, -KEEP_RECENT)) {
     if (typeof block.content !== "string" || block.content.length <= 100) continue;
-    const toolId = block.tool_use_id ?? "";
-    const toolName = toolNameMap[toolId] ?? "unknown";
-    if (PRESERVE_RESULT_TOOLS.has(toolName)) continue;
-    block.content = `[Previous: used ${toolName}]`;
+    block.content = `[Previous tool result]`;
   }
 }
 
-async function autoCompact(messages: MessageParam[], focus?: string | null): Promise<MessageParam[]> {
+async function autoCompact(messages: Message[], focus?: string | null): Promise<Message[]> {
   fs.mkdirSync(TRANSCRIPT_DIR, { recursive: true });
   const p = path.join(TRANSCRIPT_DIR, `transcript_${Date.now()}.jsonl`);
   fs.writeFileSync(p, messages.map((m) => jsonStringifySafe(m)).join("\n") + "\n", "utf8");
@@ -374,13 +349,10 @@ async function autoCompact(messages: MessageParam[], focus?: string | null): Pro
     "5) Context to preserve: user preferences, domain details, commitments\n" +
     "Be concise but preserve critical details.\n";
   if (focus) prompt += `\nPay special attention to: ${focus}\n`;
-  const resp = await client.messages.create({
-    model: MODEL,
-    messages: [{ role: "user", content: prompt + "\n" + convText }],
-    max_tokens: 4000,
-  });
-  const first = resp.content[0];
-  const summary = first && first.type === "text" ? first.text : "";
+  const resp = await callChatCompletion([{ role: "user", content: prompt + "\n" + convText }], [], "Summarize this conversation for continuity.");
+  const summary = Array.isArray(resp.content)
+    ? resp.content.filter((b): b is { type: "text"; text: string } => "type" in b && b.type === "text" && typeof b.text === "string").map((b) => b.text).join("")
+    : String(resp.content);
   const continuation =
     "This session is being continued from a previous conversation that ran out " +
     "of context. The summary below covers the earlier portion of the conversation.\n\n" +
@@ -673,8 +645,8 @@ class TeammateManager {
     const sysPrompt =
       `You are '${name}', role: ${role}, team: ${teamName}, at ${WORKDIR}. ` +
       `Use idle when done with current work. You may auto-claim tasks.`;
-    const messages: MessageParam[] = [{ role: "user", content: prompt }];
-    const tools: Tool[] = [
+    const messages: Message[] = [{ role: "user", content: prompt }];
+    const tools = convertTools([
       {
         name: "bash",
         description: "Run command.",
@@ -722,13 +694,13 @@ class TeammateManager {
         description: "Claim task by ID.",
         input_schema: { type: "object", properties: { task_id: { type: "integer" } }, required: ["task_id"] },
       },
-    ];
+    ]);
 
     while (true) {
       for (let i = 0; i < 50; i++) {
         const inbox = this.bus.readInbox(name) as Record<string, unknown>[];
         for (const msg of inbox) {
-          if (msg.type === "shutdown_request") {
+          if ((msg as { type?: string }).type === "shutdown_request") {
             this._setStatus(name, "shutdown");
             return;
           }
@@ -736,31 +708,35 @@ class TeammateManager {
         }
         let response;
         try {
-          response = await client.messages.create({
-            model: MODEL,
-            system: sysPrompt,
-            messages,
-            tools,
-            max_tokens: 8000,
-          });
+          response = await callChatCompletion(messages, tools, sysPrompt);
         } catch {
           this._setStatus(name, "shutdown");
           return;
         }
-        messages.push({ role: "assistant", content: response.content });
-        if (response.stop_reason !== "tool_use") break;
-        const results: Anthropic.Messages.ToolResultBlockParam[] = [];
+
+        // 将工具调用转换为消息
+        if (Array.isArray(response.content)) {
+          messages.push({ role: "assistant", content: JSON.stringify(response.content) });
+        } else {
+          messages.push({ role: "assistant", content: response.content });
+        }
+
+        if (!hasToolCalls(response)) break;
+
+        const toolCalls = response.content as Array<{ id: string; function: { name: string; arguments: string } }>;
+        const results: Message[] = [];
         let idleRequested = false;
-        for (const block of response.content) {
-          if (block.type !== "tool_use") continue;
+
+        for (const call of toolCalls) {
+          const toolName = call.function.name;
           let output: string;
-          if (block.name === "idle") {
+          if (toolName === "idle") {
             idleRequested = true;
             output = "Entering idle phase.";
-          } else if (block.name === "claim_task") {
-            output = this.taskMgr.claim(Number((block.input as { task_id: number }).task_id), name);
-          } else if (block.name === "send_message") {
-            const inp = block.input as { to: string; content: string };
+          } else if (toolName === "claim_task") {
+            output = this.taskMgr.claim(Number((getToolCallArgs(call) as { task_id: number }).task_id), name);
+          } else if (toolName === "send_message") {
+            const inp = getToolCallArgs(call) as { to: string; content: string };
             output = this.bus.send(name, inp.to, inp.content);
           } else {
             const dispatch: Record<string, (kw: Record<string, unknown>) => string> = {
@@ -769,13 +745,13 @@ class TeammateManager {
               write_file: (kw) => runWrite(String(kw.path), String(kw.content)),
               edit_file: (kw) => runEdit(String(kw.path), String(kw.old_text), String(kw.new_text)),
             };
-            const fn = dispatch[block.name];
-            output = fn ? fn((block.input ?? {}) as Record<string, unknown>) : "Unknown";
+            const fn = dispatch[toolName];
+            output = fn ? fn(getToolCallArgs(call)) : "Unknown";
           }
-          console.log(`  [${name}] ${block.name}: ${String(output).slice(0, 120)}`);
-          results.push({ type: "tool_result", tool_use_id: block.id, content: String(output) });
+          console.log(`  [${name}] ${toolName}: ${String(output).slice(0, 120)}`);
+          results.push({ role: "tool", tool_call_id: call.id, content: String(output) });
         }
-        messages.push({ role: "user", content: results });
+        messages.push(...results);
         if (idleRequested) break;
       }
 
@@ -907,7 +883,7 @@ const TOOL_HANDLERS: Record<string, (input: Record<string, unknown>) => string |
   claim_task: async (kw) => TASK_MGR.claim(Number(kw.task_id), "lead"),
 };
 
-const TOOLS: Tool[] = [
+const TOOLS_RAW: Tool[] = [
   {
     name: "bash",
     description: "Run a shell command.",
@@ -1086,7 +1062,9 @@ const TOOLS: Tool[] = [
   },
 ];
 
-async function agentLoop(messages: MessageParam[]): Promise<void> {
+const TOOLS = convertTools(TOOLS_RAW);
+
+async function agentLoop(messages: Message[]): Promise<void> {
   let roundsWithoutTodo = 0;
   while (true) {
     microcompact(messages);
@@ -1107,42 +1085,46 @@ async function agentLoop(messages: MessageParam[]): Promise<void> {
       messages.push({ role: "user", content: `<inbox>${JSON.stringify(inbox, null, 2)}</inbox>` });
       messages.push({ role: "assistant", content: "Noted inbox messages." });
     }
-    const response = await client.messages.create({
-      model: MODEL,
-      system: SYSTEM,
-      messages,
-      tools: TOOLS,
-      max_tokens: 8000,
-    });
-    messages.push({ role: "assistant", content: response.content });
-    if (response.stop_reason !== "tool_use") return;
-    const results: Array<Anthropic.Messages.ToolResultBlockParam | Anthropic.Messages.TextBlockParam> = [];
+    const response = await callChatCompletion(messages, TOOLS, SYSTEM);
+
+    // 将工具调用转换为消息
+    if (Array.isArray(response.content)) {
+      messages.push({ role: "assistant", content: JSON.stringify(response.content) });
+    } else {
+      messages.push({ role: "assistant", content: response.content });
+    }
+
+    if (!hasToolCalls(response)) return;
+
+    const toolCalls = response.content as Array<{ id: string; function: { name: string; arguments: string } }>;
+    const results: Message[] = [];
     let usedTodo = false;
     let manualCompress = false;
     let compactFocus: string | null = null;
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
-      if (block.name === "compress") {
+
+    for (const call of toolCalls) {
+      const toolName = call.function.name;
+      if (toolName === "compress") {
         manualCompress = true;
-        compactFocus = ((block.input ?? {}) as { focus?: string }).focus ?? null;
+        compactFocus = ((getToolCallArgs(call) as { focus?: string }).focus) ?? null;
       }
-      const handler = TOOL_HANDLERS[block.name];
+      const handler = TOOL_HANDLERS[toolName];
       let output: string;
       try {
-        const toolInput = { ...(block.input as Record<string, unknown>), tool_use_id: block.id };
-        output = String(handler ? await handler(toolInput) : `Unknown tool: ${block.name}`);
+        const toolInput = { ...getToolCallArgs(call), tool_use_id: call.id };
+        output = String(handler ? await handler(toolInput) : `Unknown tool: ${toolName}`);
       } catch (e) {
         output = `Error: ${e}`;
       }
-      console.log(`> ${block.name}: ${output.slice(0, 200)}`);
-      results.push({ type: "tool_result", tool_use_id: block.id, content: output });
-      if (block.name === "TodoWrite") usedTodo = true;
+      console.log(`> ${toolName}: ${output.slice(0, 200)}`);
+      results.push({ role: "tool", tool_call_id: call.id, content: output });
+      if (toolName === "TodoWrite") usedTodo = true;
     }
     roundsWithoutTodo = usedTodo ? 0 : roundsWithoutTodo + 1;
     if (TODO.hasOpenItems() && roundsWithoutTodo >= 3) {
-      results.unshift({ type: "text", text: "<reminder>Update your todos.</reminder>" });
+      results.unshift({ role: "user", content: "<reminder>Update your todos.</reminder>" });
     }
-    messages.push({ role: "user", content: results });
+    messages.push(...results);
     if (manualCompress) {
       console.log("[manual compact]");
       const replacement = await autoCompact(messages, compactFocus);
@@ -1153,7 +1135,7 @@ async function agentLoop(messages: MessageParam[]): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const history: MessageParam[] = [];
+  const history: Message[] = [];
   const rl = readline.createInterface({ input, output });
   try {
     while (true) {

@@ -18,20 +18,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as dotenv from "dotenv";
-import Anthropic from "@anthropic-ai/sdk";
-import type { MessageParam, Tool } from "@anthropic-ai/sdk/resources/messages";
+import { callChatCompletion, convertTools, hasToolCalls, getToolCallArgs, type Message, type Tool } from "./lib/openai-client";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL ?? undefined,
-});
 const MODEL = process.env.MODEL_ID!;
 
 const SYSTEM = `You are a coding agent at ${WORKDIR}. Keep working step by step, and use compact if the conversation gets too long.`;
@@ -53,7 +44,7 @@ function jsonStringifySafe(value: unknown): string {
   return JSON.stringify(value, (_, v) => (typeof v === "bigint" ? v.toString() : v));
 }
 
-function estimateContextSize(messages: MessageParam[]): number {
+function estimateContextSize(messages: Message[]): number {
   return jsonStringifySafe(messages).length;
 }
 
@@ -95,7 +86,7 @@ function persistLargeOutput(toolUseId: string, output: string): string {
   );
 }
 
-function collectToolResultBlocks(messages: MessageParam[]): Array<{ mi: number; bi: number; block: Record<string, unknown> }> {
+function collectToolResultBlocks(messages: Message[]): Array<{ mi: number; bi: number; block: Record<string, unknown> }> {
   const blocks: Array<{ mi: number; bi: number; block: Record<string, unknown> }> = [];
   messages.forEach((message, messageIndex) => {
     const content = message.content;
@@ -109,7 +100,7 @@ function collectToolResultBlocks(messages: MessageParam[]): Array<{ mi: number; 
   return blocks;
 }
 
-function microCompact(messages: MessageParam[]): void {
+function microCompact(messages: Message[]): void {
   const toolResults = collectToolResultBlocks(messages);
   if (toolResults.length <= KEEP_RECENT_TOOL_RESULTS) return;
 
@@ -121,7 +112,7 @@ function microCompact(messages: MessageParam[]): void {
   }
 }
 
-function writeTranscript(messages: MessageParam[]): string {
+function writeTranscript(messages: Message[]): string {
   fs.mkdirSync(TRANSCRIPT_DIR, { recursive: true });
   const p = path.join(TRANSCRIPT_DIR, `transcript_${Date.now()}.jsonl`);
   const lines = messages.map((m) => jsonStringifySafe(m)).join("\n");
@@ -129,7 +120,7 @@ function writeTranscript(messages: MessageParam[]): string {
   return p;
 }
 
-async function summarizeHistory(messages: MessageParam[]): Promise<string> {
+async function summarizeHistory(messages: Message[]): Promise<string> {
   const conversation = jsonStringifySafe(messages).slice(0, 80_000);
   const prompt =
     "Summarize this coding-agent conversation so work can continue.\n" +
@@ -141,16 +132,11 @@ async function summarizeHistory(messages: MessageParam[]): Promise<string> {
     "5. User constraints and preferences\n" +
     "Be compact but concrete.\n\n" +
     conversation;
-  const response = await client.messages.create({
-    model: MODEL,
-    messages: [{ role: "user", content: prompt }],
-    max_tokens: 2000,
-  });
-  const first = response.content[0];
-  return first && first.type === "text" ? first.text.trim() : "";
+  const response = await callChatCompletion([{ role: "user", content: prompt }], undefined, undefined);
+  return String(response.content).trim() || "";
 }
 
-async function compactHistory(messages: MessageParam[], state: CompactState, focus?: string | null): Promise<MessageParam[]> {
+async function compactHistory(messages: Message[], state: CompactState, focus?: string | null): Promise<Message[]> {
   const transcriptPath = writeTranscript(messages);
   console.log(`[transcript saved: ${transcriptPath}]`);
 
@@ -237,7 +223,7 @@ function runEdit(filePath: string, oldText: string, newText: string): string {
   }
 }
 
-const TOOLS: Tool[] = [
+const TOOLS = convertTools([
   {
     name: "bash",
     description: "Run a shell command.",
@@ -286,7 +272,7 @@ const TOOLS: Tool[] = [
       properties: { focus: { type: "string" } },
     },
   },
-];
+]);
 
 function extractText(content: unknown): string {
   if (!Array.isArray(content)) return "";
@@ -297,7 +283,7 @@ function extractText(content: unknown): string {
   return texts.join("\n").trim();
 }
 
-function executeTool(block: Anthropic.Messages.ToolUseBlock, state: CompactState): string {
+function executeTool(block: { name: string; id: string; input?: Record<string, unknown> }, state: CompactState): string {
   const input = (block.input ?? {}) as Record<string, unknown>;
   if (block.name === "bash") {
     return runBash(String(input.command), block.id);
@@ -317,7 +303,7 @@ function executeTool(block: Anthropic.Messages.ToolUseBlock, state: CompactState
   return `Unknown tool: ${block.name}`;
 }
 
-async function agentLoop(messages: MessageParam[], state: CompactState): Promise<void> {
+async function agentLoop(messages: Message[], state: CompactState): Promise<void> {
   while (true) {
     microCompact(messages);
 
@@ -326,44 +312,45 @@ async function agentLoop(messages: MessageParam[], state: CompactState): Promise
       messages.splice(0, messages.length, ...(await compactHistory(messages, state)));
     }
 
-    const response = await client.messages.create({
-      model: MODEL,
-      system: SYSTEM,
-      messages,
-      tools: TOOLS,
-      max_tokens: 8000,
-    });
-    messages.push({ role: "assistant", content: response.content });
+    const response = await callChatCompletion(messages, TOOLS, SYSTEM);
 
-    if (response.stop_reason !== "tool_use") return;
-
-    const results: Anthropic.Messages.ToolResultBlockParam[] = [];
-    let manualCompact = false;
-    let compactFocus: string | null | undefined;
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
-
-      const output = executeTool(block, state);
-      if (block.name === "compact") {
-        manualCompact = true;
-        compactFocus = ((block.input ?? {}) as { focus?: string }).focus;
-      }
-
-      console.log(`> ${block.name}: ${String(output).slice(0, 200)}`);
-      results.push({ type: "tool_result", tool_use_id: block.id, content: String(output) });
+    // 将工具调用转换为消息
+    if (Array.isArray(response.content)) {
+      messages.push({ role: "assistant", content: JSON.stringify(response.content) });
+    } else {
+      messages.push({ role: "assistant", content: response.content });
     }
 
-    messages.push({ role: "user", content: results });
+    if (!hasToolCalls(response)) return;
+
+    const toolCalls = response.content as Array<{ id: string; function: { name: string; arguments: string } }>;
+    const results: Message[] = [];
+    let manualCompact = false;
+    let compactFocus: string | null = null;
+
+    for (const call of toolCalls) {
+      const output = executeTool({ name: call.function.name, id: call.id, input: getToolCallArgs(call) }, state);
+      if (call.function.name === "compact") {
+        manualCompact = true;
+        const args = getToolCallArgs(call);
+        compactFocus = (args.focus as string) ?? null;
+      }
+
+      console.log(`> ${call.function.name}: ${String(output).slice(0, 200)}`);
+      results.push({ role: "tool", tool_call_id: call.id, content: String(output) });
+    }
+
+    messages.push(...results);
 
     if (manualCompact) {
       console.log("[manual compact]");
-      messages.splice(0, messages.length, ...(await compactHistory(messages, state, compactFocus ?? null)));
+      messages.splice(0, messages.length, ...(await compactHistory(messages, state, compactFocus)));
     }
   }
 }
 
 async function main(): Promise<void> {
-  const history: MessageParam[] = [];
+  const history: Message[] = [];
   const compactState: CompactState = { hasCompacted: false, lastSummary: "", recentFiles: [] };
 
   const rl = readline.createInterface({ input, output });

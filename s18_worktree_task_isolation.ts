@@ -11,17 +11,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as dotenv from "dotenv";
-import Anthropic from "@anthropic-ai/sdk";
-import type { MessageParam, Tool } from "@anthropic-ai/sdk/resources/messages";
+import { callChatCompletion, convertTools, hasToolCalls, getToolCallArgs, type Message, type Tool } from "./lib/openai-client";
 
 dotenv.config({ override: true });
-if (process.env.ANTHROPIC_BASE_URL) delete process.env.ANTHROPIC_AUTH_TOKEN;
-
-const WORKDIR = process.cwd();
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL ?? undefined,
-});
 const MODEL = process.env.MODEL_ID!;
 
 function detectRepoRoot(cwd: string): string | null {
@@ -560,7 +552,7 @@ const TOOL_HANDLERS: Record<string, (input: Record<string, unknown>) => string> 
   worktree_events: (kw) => EVENTS.listRecent(kw.limit as number | undefined),
 };
 
-const TOOLS: Tool[] = [
+const TOOLS = convertTools([
   {
     name: "bash",
     description: "Run a shell command in the current workspace.",
@@ -716,31 +708,34 @@ const TOOLS: Tool[] = [
   },
 ];
 
-async function agentLoop(messages: MessageParam[]): Promise<void> {
+async function agentLoop(messages: Message[]): Promise<void> {
   while (true) {
-    const response = await client.messages.create({
-      model: MODEL,
-      system: SYSTEM,
-      messages,
-      tools: TOOLS,
-      max_tokens: 8000,
-    });
-    messages.push({ role: "assistant", content: response.content });
-    if (response.stop_reason !== "tool_use") return;
-    const results: Anthropic.Messages.ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
-      const handler = TOOL_HANDLERS[block.name];
+    const response = await callChatCompletion(messages, TOOLS, SYSTEM);
+
+    // 将工具调用转换为消息
+    if (Array.isArray(response.content)) {
+      messages.push({ role: "assistant", content: JSON.stringify(response.content) });
+    } else {
+      messages.push({ role: "assistant", content: response.content });
+    }
+
+    if (!hasToolCalls(response)) return;
+
+    const toolCalls = response.content as Array<{ id: string; function: { name: string; arguments: string } }>;
+    const results: Message[] = [];
+
+    for (const call of toolCalls) {
+      const handler = TOOL_HANDLERS[call.function.name];
       let output: string;
       try {
-        output = handler ? handler((block.input ?? {}) as Record<string, unknown>) : `Unknown tool: ${block.name}`;
+        output = handler ? handler(getToolCallArgs(call)) : `Unknown tool: ${call.function.name}`;
       } catch (e) {
         output = `Error: ${e}`;
       }
-      console.log(`> ${block.name}: ${output.slice(0, 200)}`);
-      results.push({ type: "tool_result", tool_use_id: block.id, content: String(output) });
+      console.log(`> ${call.function.name}: ${output.slice(0, 200)}`);
+      results.push({ role: "tool", tool_call_id: call.id, content: String(output) });
     }
-    messages.push({ role: "user", content: results });
+    messages.push(...results);
   }
 }
 
@@ -748,7 +743,7 @@ async function main(): Promise<void> {
   console.log(`Repo root for s18: ${REPO_ROOT}`);
   if (!WORKTREES.gitAvailable) console.log("Note: Not in a git repo. worktree_* tools will return errors.");
 
-  const history: MessageParam[] = [];
+  const history: Message[] = [];
   const rl = readline.createInterface({ input, output });
   try {
     while (true) {

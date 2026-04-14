@@ -12,20 +12,11 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as crypto from "node:crypto";
 import * as dotenv from "dotenv";
-import Anthropic from "@anthropic-ai/sdk";
-import type { MessageParam, Tool } from "@anthropic-ai/sdk/resources/messages";
+import { callChatCompletion, convertTools, hasToolCalls, getToolCallArgs, type Message, type Tool } from "./lib/openai-client";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL ?? undefined,
-});
 const MODEL = process.env.MODEL_ID!;
 
 const SCHEDULED_TASKS_FILE = path.join(WORKDIR, ".claude", "scheduled_tasks.json");
@@ -364,7 +355,7 @@ const TOOL_HANDLERS: Record<string, (input: Record<string, unknown>) => string> 
   cron_list: () => scheduler.listTasks(),
 };
 
-const TOOLS: Tool[] = [
+const TOOLS = convertTools([
   {
     name: "bash",
     description: "Run a shell command.",
@@ -433,13 +424,13 @@ const TOOLS: Tool[] = [
     description: "List all scheduled tasks.",
     input_schema: { type: "object", properties: {} },
   },
-];
+]);
 
 const SYSTEM = `You are a coding agent at ${WORKDIR}. Use tools to solve tasks.
 
 You can schedule future work with cron_create. Tasks fire automatically and their prompts are injected into the conversation.`;
 
-async function agentLoop(messages: MessageParam[]): Promise<void> {
+async function agentLoop(messages: Message[]): Promise<void> {
   while (true) {
     const notifications = scheduler.drainNotifications();
     for (const note of notifications) {
@@ -447,32 +438,33 @@ async function agentLoop(messages: MessageParam[]): Promise<void> {
       messages.push({ role: "user", content: note });
     }
 
-    const response = await client.messages.create({
-      model: MODEL,
-      system: SYSTEM,
-      messages,
-      tools: TOOLS,
-      max_tokens: 8000,
-    });
-    messages.push({ role: "assistant", content: response.content });
+    const response = await callChatCompletion(messages, TOOLS, SYSTEM);
 
-    if (response.stop_reason !== "tool_use") return;
+    // 将工具调用转换为消息
+    if (Array.isArray(response.content)) {
+      messages.push({ role: "assistant", content: JSON.stringify(response.content) });
+    } else {
+      messages.push({ role: "assistant", content: response.content });
+    }
 
-    const results: Anthropic.Messages.ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
-      const handler = TOOL_HANDLERS[block.name];
+    if (!hasToolCalls(response)) return;
+
+    const toolCalls = response.content as Array<{ id: string; function: { name: string; arguments: string } }>;
+    const results: Message[] = [];
+
+    for (const call of toolCalls) {
+      const handler = TOOL_HANDLERS[call.function.name];
       let output: string;
       try {
-        output = handler ? handler((block.input ?? {}) as Record<string, unknown>) : `Unknown: ${block.name}`;
+        output = handler ? handler(getToolCallArgs(call)) : `Unknown: ${call.function.name}`;
       } catch (e) {
         output = `Error: ${e}`;
       }
-      console.log(`> ${block.name}: ${output.slice(0, 200)}`);
-      results.push({ type: "tool_result", tool_use_id: block.id, content: String(output) });
+      console.log(`> ${call.function.name}: ${output.slice(0, 200)}`);
+      results.push({ role: "tool", tool_call_id: call.id, content: String(output) });
     }
 
-    messages.push({ role: "user", content: results });
+    messages.push(...results);
   }
 }
 
@@ -481,7 +473,7 @@ async function main(): Promise<void> {
   console.log("[Cron scheduler running. Background checks every second.]");
   console.log("[Commands: /cron to list tasks, /test to fire a test notification]");
 
-  const history: MessageParam[] = [];
+  const history: Message[] = [];
   const rl = readline.createInterface({ input, output });
   try {
     while (true) {

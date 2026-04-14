@@ -11,20 +11,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as dotenv from "dotenv";
-import Anthropic from "@anthropic-ai/sdk";
-import type { MessageParam, Tool } from "@anthropic-ai/sdk/resources/messages";
+import { callChatCompletion, convertTools, hasToolCalls, getToolCallArgs, type Message, type Tool } from "./lib/openai-client";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL ?? undefined,
-});
 const MODEL = process.env.MODEL_ID!;
 
 const MODES = ["default", "plan", "auto"] as const;
@@ -265,7 +256,7 @@ const TOOL_HANDLERS: Record<string, (input: Record<string, unknown>) => string> 
   edit_file: (kw) => runEdit(String(kw.path), String(kw.old_text), String(kw.new_text)),
 };
 
-const TOOLS: Tool[] = [
+const TOOLS = convertTools([
   {
     name: "bash",
     description: "Run a shell command.",
@@ -306,53 +297,54 @@ const TOOLS: Tool[] = [
       required: ["path", "old_text", "new_text"],
     },
   },
-];
+]);
 
 const SYSTEM = `You are a coding agent at ${WORKDIR}. Use tools to solve tasks.
 The user controls permissions. Some tool calls may be denied.`;
 
-async function agentLoop(messages: MessageParam[], perms: PermissionManager, rl: readline.Interface): Promise<void> {
+async function agentLoop(messages: Message[], perms: PermissionManager, rl: readline.Interface): Promise<void> {
   while (true) {
-    const response = await client.messages.create({
-      model: MODEL,
-      system: SYSTEM,
-      messages,
-      tools: TOOLS,
-      max_tokens: 8000,
-    });
-    messages.push({ role: "assistant", content: response.content });
+    const response = await callChatCompletion(messages, TOOLS, SYSTEM);
 
-    if (response.stop_reason !== "tool_use") return;
+    // 将工具调用转换为消息
+    if (Array.isArray(response.content)) {
+      messages.push({ role: "assistant", content: JSON.stringify(response.content) });
+    } else {
+      messages.push({ role: "assistant", content: response.content });
+    }
 
-    const results: Anthropic.Messages.ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
+    if (!hasToolCalls(response)) return;
 
-      const decision = perms.check(block.name, (block.input ?? {}) as Record<string, unknown>);
+    const toolCalls = response.content as Array<{ id: string; function: { name: string; arguments: string } }>;
+    const results: Message[] = [];
+
+    for (const call of toolCalls) {
+      const input = getToolCallArgs(call);
+      const decision = perms.check(call.function.name, input);
       let output: string;
 
       if (decision.behavior === "deny") {
         output = `Permission denied: ${decision.reason}`;
-        console.log(`  [DENIED] ${block.name}: ${decision.reason}`);
+        console.log(`  [DENIED] ${call.function.name}: ${decision.reason}`);
       } else if (decision.behavior === "ask") {
-        if (await perms.askUser(block.name, (block.input ?? {}) as Record<string, unknown>, rl)) {
-          const handler = TOOL_HANDLERS[block.name];
-          output = handler ? handler((block.input ?? {}) as Record<string, unknown>) : `Unknown: ${block.name}`;
-          console.log(`> ${block.name}: ${output.slice(0, 200)}`);
+        if (await perms.askUser(call.function.name, input, rl)) {
+          const handler = TOOL_HANDLERS[call.function.name];
+          output = handler ? handler(input) : `Unknown: ${call.function.name}`;
+          console.log(`> ${call.function.name}: ${output.slice(0, 200)}`);
         } else {
-          output = `Permission denied by user for ${block.name}`;
-          console.log(`  [USER DENIED] ${block.name}`);
+          output = `Permission denied by user for ${call.function.name}`;
+          console.log(`  [USER DENIED] ${call.function.name}`);
         }
       } else {
-        const handler = TOOL_HANDLERS[block.name];
-        output = handler ? handler((block.input ?? {}) as Record<string, unknown>) : `Unknown: ${block.name}`;
-        console.log(`> ${block.name}: ${output.slice(0, 200)}`);
+        const handler = TOOL_HANDLERS[call.function.name];
+        output = handler ? handler(input) : `Unknown: ${call.function.name}`;
+        console.log(`> ${call.function.name}: ${output.slice(0, 200)}`);
       }
 
-      results.push({ type: "tool_result", tool_use_id: block.id, content: String(output) });
+      results.push({ role: "tool", tool_call_id: call.id, content: String(output) });
     }
 
-    messages.push({ role: "user", content: results });
+    messages.push(...results);
   }
 }
 
@@ -366,7 +358,7 @@ async function main(): Promise<void> {
     const perms = new PermissionManager(modeInput);
     console.log(`[Permission mode: ${modeInput}]`);
 
-    const history: MessageParam[] = [];
+    const history: Message[] = [];
     while (true) {
       let query: string;
       try {

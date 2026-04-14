@@ -11,20 +11,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as dotenv from "dotenv";
-import Anthropic from "@anthropic-ai/sdk";
-import type { MessageParam, Tool } from "@anthropic-ai/sdk/resources/messages";
+import { callChatCompletion, convertTools, hasToolCalls, getToolCallArgs, type Message, type Tool } from "./lib/openai-client";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL ?? undefined,
-});
 const MODEL = process.env.MODEL_ID!;
 
 const MEMORY_DIR = path.join(WORKDIR, ".memory");
@@ -367,7 +358,7 @@ const TOOL_HANDLERS: Record<string, (input: Record<string, unknown>) => string> 
   save_memory: (kw) => runSaveMemory(String(kw.name), String(kw.description), String(kw.type), String(kw.content)),
 };
 
-const TOOLS: Tool[] = [
+const TOOLS = convertTools([
   {
     name: "bash",
     description: "Run a shell command.",
@@ -430,7 +421,7 @@ const TOOLS: Tool[] = [
       required: ["name", "description", "type", "content"],
     },
   },
-];
+]);
 
 const MEMORY_GUIDANCE = `
 When to save memories:
@@ -456,37 +447,36 @@ function buildSystemPrompt(): string {
   return parts.join("\n\n");
 }
 
-async function agentLoop(messages: MessageParam[]): Promise<void> {
+async function agentLoop(messages: Message[]): Promise<void> {
   while (true) {
     const system = buildSystemPrompt();
-    const response = await client.messages.create({
-      model: MODEL,
-      system,
-      messages,
-      tools: TOOLS,
-      max_tokens: 8000,
-    });
-    messages.push({ role: "assistant", content: response.content });
+    const response = await callChatCompletion(messages, TOOLS, system);
 
-    if (response.stop_reason !== "tool_use") return;
+    // 将工具调用转换为消息
+    if (Array.isArray(response.content)) {
+      messages.push({ role: "assistant", content: JSON.stringify(response.content) });
+    } else {
+      messages.push({ role: "assistant", content: response.content });
+    }
 
-    const results: Anthropic.Messages.ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
-      const handler = TOOL_HANDLERS[block.name];
+    if (!hasToolCalls(response)) return;
+
+    const toolCalls = response.content as Array<{ id: string; function: { name: string; arguments: string } }>;
+    const results: Message[] = [];
+
+    for (const call of toolCalls) {
+      const handler = TOOL_HANDLERS[call.function.name];
       let output: string;
       try {
-        output = handler
-          ? handler((block.input ?? {}) as Record<string, unknown>)
-          : `Unknown: ${block.name}`;
+        output = handler ? handler(getToolCallArgs(call)) : `Unknown: ${call.function.name}`;
       } catch (e) {
         output = `Error: ${e}`;
       }
-      console.log(`> ${block.name}: ${output.slice(0, 200)}`);
-      results.push({ type: "tool_result", tool_use_id: block.id, content: String(output) });
+      console.log(`> ${call.function.name}: ${output.slice(0, 200)}`);
+      results.push({ role: "tool", tool_call_id: call.id, content: String(output) });
     }
 
-    messages.push({ role: "user", content: results });
+    messages.push(...results);
   }
 }
 
@@ -499,7 +489,7 @@ async function main(): Promise<void> {
     console.log("[No existing memories. The agent can create them with save_memory.]");
   }
 
-  const history: MessageParam[] = [];
+  const history: Message[] = [];
   const rl = readline.createInterface({ input, output });
   try {
     while (true) {

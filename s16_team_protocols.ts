@@ -15,17 +15,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as dotenv from "dotenv";
-import Anthropic from "@anthropic-ai/sdk";
-import type { MessageParam, Tool } from "@anthropic-ai/sdk/resources/messages";
+import { callChatCompletion, convertTools, hasToolCalls, getToolCallArgs, type Message, type Tool } from "./lib/openai-client";
 
 dotenv.config({ override: true });
-if (process.env.ANTHROPIC_BASE_URL) delete process.env.ANTHROPIC_AUTH_TOKEN;
 
 const WORKDIR = process.cwd();
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL ?? undefined,
-});
 const MODEL = process.env.MODEL_ID!;
 const TEAM_DIR = path.join(WORKDIR, ".team");
 const INBOX_DIR = path.join(TEAM_DIR, "inbox");
@@ -183,7 +177,7 @@ class TeammateManager {
       `You are '${name}', role: ${role}, at ${WORKDIR}. ` +
       `Submit plans via plan_approval before major work. ` +
       `Respond to shutdown_request with shutdown_response.`;
-    const messages: MessageParam[] = [{ role: "user", content: prompt }];
+    const messages: Message[] = [{ role: "user", content: prompt }];
     const tools = this._teammateTools();
     let shouldExit = false;
     try {
@@ -193,26 +187,30 @@ class TeammateManager {
           messages.push({ role: "user", content: JSON.stringify(msg) });
         }
         if (shouldExit) break;
-        const response = await client.messages.create({
-          model: MODEL,
-          system: sysPrompt,
-          messages,
-          tools,
-          max_tokens: 8000,
-        });
-        messages.push({ role: "assistant", content: response.content });
-        if (response.stop_reason !== "tool_use") break;
-        const results: Anthropic.Messages.ToolResultBlockParam[] = [];
-        for (const block of response.content) {
-          if (block.type !== "tool_use") continue;
-          const output = this._exec(name, block.name, (block.input ?? {}) as Record<string, unknown>);
-          console.log(`  [${name}] ${block.name}: ${String(output).slice(0, 120)}`);
-          results.push({ type: "tool_result", tool_use_id: block.id, content: String(output) });
-          if (block.name === "shutdown_response" && (block.input as { approve?: boolean }).approve) {
-            shouldExit = true;
+        const response = await callChatCompletion(messages, tools, sysPrompt);
+
+        // 将工具调用转换为消息
+        if (Array.isArray(response.content)) {
+          messages.push({ role: "assistant", content: JSON.stringify(response.content) });
+        } else {
+          messages.push({ role: "assistant", content: response.content });
+        }
+
+        if (!hasToolCalls(response)) break;
+
+        const toolCalls = response.content as Array<{ id: string; function: { name: string; arguments: string } }>;
+        const results: Message[] = [];
+
+        for (const call of toolCalls) {
+          const output = this._exec(name, call.function.name, getToolCallArgs(call));
+          console.log(`  [${name}] ${call.function.name}: ${String(output).slice(0, 120)}`);
+          results.push({ role: "tool", tool_call_id: call.id, content: String(output) });
+          if (call.function.name === "shutdown_response") {
+            const args = getToolCallArgs(call) as { approve?: boolean };
+            if (args.approve) shouldExit = true;
           }
         }
-        messages.push({ role: "user", content: results });
+        messages.push(...results);
       }
     } catch {
       /* ignore */
@@ -274,7 +272,7 @@ class TeammateManager {
   }
 
   private _teammateTools(): Tool[] {
-    return [
+    return convertTools([
       {
         name: "bash",
         description: "Run a shell command.",
@@ -348,7 +346,7 @@ class TeammateManager {
         description: "Submit a plan for lead approval. Provide plan text.",
         input_schema: { type: "object", properties: { plan: { type: "string" } }, required: ["plan"] },
       },
-    ];
+    ]);
   }
 
   listAll(): string {
@@ -483,7 +481,7 @@ const TOOL_HANDLERS: Record<string, (input: Record<string, unknown>) => string> 
   plan_approval: (kw) => handlePlanReview(String(kw.request_id), Boolean(kw.approve), String(kw.feedback ?? "")),
 };
 
-const TOOLS: Tool[] = [
+const TOOLS = convertTools([
   {
     name: "bash",
     description: "Run a shell command.",
@@ -588,43 +586,46 @@ const TOOLS: Tool[] = [
       required: ["request_id", "approve"],
     },
   },
-];
+]);
 
-async function agentLoop(messages: MessageParam[]): Promise<void> {
+async function agentLoop(messages: Message[]): Promise<void> {
   while (true) {
     const inbox = BUS.readInbox("lead");
     if (inbox.length) {
       messages.push({ role: "user", content: `<inbox>${JSON.stringify(inbox, null, 2)}</inbox>` });
     }
-    const response = await client.messages.create({
-      model: MODEL,
-      system: SYSTEM,
-      messages,
-      tools: TOOLS,
-      max_tokens: 8000,
-    });
-    messages.push({ role: "assistant", content: response.content });
-    if (response.stop_reason !== "tool_use") return;
-    const results: Anthropic.Messages.ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
-      const handler = TOOL_HANDLERS[block.name];
+    const response = await callChatCompletion(messages, TOOLS, SYSTEM);
+
+    // 将工具调用转换为消息
+    if (Array.isArray(response.content)) {
+      messages.push({ role: "assistant", content: JSON.stringify(response.content) });
+    } else {
+      messages.push({ role: "assistant", content: response.content });
+    }
+
+    if (!hasToolCalls(response)) return;
+
+    const toolCalls = response.content as Array<{ id: string; function: { name: string; arguments: string } }>;
+    const results: Message[] = [];
+
+    for (const call of toolCalls) {
+      const handler = TOOL_HANDLERS[call.function.name];
       let output: string;
       try {
-        output = handler ? handler((block.input ?? {}) as Record<string, unknown>) : `Unknown tool: ${block.name}`;
+        output = handler ? handler(getToolCallArgs(call)) : `Unknown tool: ${call.function.name}`;
       } catch (e) {
         output = `Error: ${e}`;
       }
-      console.log(`> ${block.name}:`);
+      console.log(`> ${call.function.name}:`);
       console.log(output.slice(0, 200));
-      results.push({ type: "tool_result", tool_use_id: block.id, content: String(output) });
+      results.push({ role: "tool", tool_call_id: call.id, content: String(output) });
     }
-    messages.push({ role: "user", content: results });
+    messages.push(...results);
   }
 }
 
 async function main(): Promise<void> {
-  const history: MessageParam[] = [];
+  const history: Message[] = [];
   const rl = readline.createInterface({ input, output });
   try {
     while (true) {

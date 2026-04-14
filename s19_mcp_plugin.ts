@@ -14,17 +14,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as dotenv from "dotenv";
-import Anthropic from "@anthropic-ai/sdk";
-import type { MessageParam, Tool } from "@anthropic-ai/sdk/resources/messages";
+import { callChatCompletion, convertTools, hasToolCalls, getToolCallArgs, type Message, type Tool } from "./lib/openai-client";
 
 dotenv.config({ override: true });
-if (process.env.ANTHROPIC_BASE_URL) delete process.env.ANTHROPIC_AUTH_TOKEN;
-
-const WORKDIR = process.cwd();
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL ?? undefined,
-});
 const MODEL = process.env.MODEL_ID!;
 
 const PERMISSION_MODES = ["default", "auto"] as const;
@@ -371,7 +363,7 @@ const NATIVE_HANDLERS: Record<string, (input: Record<string, unknown>) => string
   edit_file: (kw) => runEdit(String(kw.path), String(kw.old_text), String(kw.new_text)),
 };
 
-const NATIVE_TOOLS: Tool[] = [
+const NATIVE_TOOLS = convertTools([
   {
     name: "bash",
     description: "Run a shell command.",
@@ -440,7 +432,7 @@ function normalizeToolResult(toolName: string, output: string, intent?: Record<s
   return JSON.stringify(payload, null, 2);
 }
 
-async function agentLoop(messages: MessageParam[], rl: readlinePromises.Interface): Promise<void> {
+async function agentLoop(messages: Message[], rl: readlinePromises.Interface): Promise<void> {
   const tools = buildToolPool();
   while (true) {
     const system =
@@ -448,41 +440,39 @@ async function agentLoop(messages: MessageParam[], rl: readlinePromises.Interfac
       "You have both native tools and MCP tools available.\n" +
       "MCP tools are prefixed with mcp__{server}__{tool}.\n" +
       "All capabilities pass through the same permission gate before execution.";
-    const response = await client.messages.create({
-      model: MODEL,
-      system,
-      messages,
-      tools,
-      max_tokens: 8000,
-    });
-    messages.push({ role: "assistant", content: response.content });
-    if (response.stop_reason !== "tool_use") return;
+    const response = await callChatCompletion(messages, tools, system);
 
-    const results: Anthropic.Messages.ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
-      const decision = permissionGate.check(block.name, (block.input ?? {}) as Record<string, unknown>);
+    // 将工具调用转换为消息
+    if (Array.isArray(response.content)) {
+      messages.push({ role: "assistant", content: JSON.stringify(response.content) });
+    } else {
+      messages.push({ role: "assistant", content: response.content });
+    }
+
+    if (!hasToolCalls(response)) return;
+
+    const toolCalls = response.content as Array<{ id: string; function: { name: string; arguments: string } }>;
+    const results: Message[] = [];
+
+    for (const call of toolCalls) {
+      const decision = permissionGate.check(call.function.name, getToolCallArgs(call));
       let out: string;
       try {
         if (
           decision.behavior === "ask" &&
-          !(await permissionGate.askUser(decision.intent, (block.input ?? {}) as Record<string, unknown>, rl))
+          !(await permissionGate.askUser(decision.intent, getToolCallArgs(call), rl))
         ) {
           out = `Permission denied by user: ${decision.reason}`;
         } else {
-          out = await handleToolCall(block.name, (block.input ?? {}) as Record<string, unknown>);
+          out = await handleToolCall(call.function.name, getToolCallArgs(call));
         }
       } catch (e) {
         out = `Error: ${e}`;
       }
-      console.log(`> ${block.name}: ${out.slice(0, 200)}`);
-      results.push({
-        type: "tool_result",
-        tool_use_id: block.id,
-        content: normalizeToolResult(block.name, String(out), decision.intent as Record<string, unknown>),
-      });
+      console.log(`> ${call.function.name}: ${out.slice(0, 200)}`);
+      results.push({ role: "tool", tool_call_id: call.id, content: normalizeToolResult(call.function.name, String(out), decision.intent as Record<string, unknown>) });
     }
-    messages.push({ role: "user", content: results });
+    messages.push(...results);
   }
 }
 
@@ -504,7 +494,7 @@ async function main(): Promise<void> {
 
   console.log(`[Tool pool: ${buildToolPool().length} tools (${mcpRouter.getAllTools().length} from MCP)]`);
 
-  const history: MessageParam[] = [];
+  const history: Message[] = [];
   const rl = readlinePromises.createInterface({ input, output });
   try {
     while (true) {

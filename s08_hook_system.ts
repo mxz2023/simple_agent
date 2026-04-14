@@ -11,20 +11,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as dotenv from "dotenv";
-import Anthropic from "@anthropic-ai/sdk";
-import type { MessageParam, Tool } from "@anthropic-ai/sdk/resources/messages";
+import { callChatCompletion, convertTools, hasToolCalls, getToolCallArgs, type Message, type Tool } from "./lib/openai-client";
 
 dotenv.config({ override: true });
 
-if (process.env.ANTHROPIC_BASE_URL) {
-  delete process.env.ANTHROPIC_AUTH_TOKEN;
-}
-
 const WORKDIR = process.cwd();
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: process.env.ANTHROPIC_BASE_URL ?? undefined,
-});
 const MODEL = process.env.MODEL_ID!;
 
 const HOOK_EVENTS = ["PreToolUse", "PostToolUse", "SessionStart"] as const;
@@ -231,7 +222,7 @@ const TOOL_HANDLERS: Record<string, (input: Record<string, unknown>) => string> 
   edit_file: (kw) => runEdit(String(kw.path), String(kw.old_text), String(kw.new_text)),
 };
 
-const TOOLS: Tool[] = [
+const TOOLS = convertTools([
   {
     name: "bash",
     description: "Run a shell command.",
@@ -272,40 +263,40 @@ const TOOLS: Tool[] = [
       required: ["path", "old_text", "new_text"],
     },
   },
-];
+]);
 
 const SYSTEM = `You are a coding agent at ${WORKDIR}. Use tools to solve tasks.`;
 
-async function agentLoop(messages: MessageParam[], hooks: HookManager): Promise<void> {
+async function agentLoop(messages: Message[], hooks: HookManager): Promise<void> {
   while (true) {
-    const response = await client.messages.create({
-      model: MODEL,
-      system: SYSTEM,
-      messages,
-      tools: TOOLS,
-      max_tokens: 8000,
-    });
-    messages.push({ role: "assistant", content: response.content });
+    const response = await callChatCompletion(messages, TOOLS, SYSTEM);
 
-    if (response.stop_reason !== "tool_use") return;
+    // 将工具调用转换为消息
+    if (Array.isArray(response.content)) {
+      messages.push({ role: "assistant", content: JSON.stringify(response.content) });
+    } else {
+      messages.push({ role: "assistant", content: response.content });
+    }
 
-    const results: Anthropic.Messages.ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type !== "tool_use") continue;
+    if (!hasToolCalls(response)) return;
 
-      const toolInput = { ...(block.input as Record<string, unknown> | undefined) };
+    const toolCalls = response.content as Array<{ id: string; function: { name: string; arguments: string } }>;
+    const results: Message[] = [];
+
+    for (const call of toolCalls) {
+      const toolInput = { ...getToolCallArgs(call) };
       const ctx: {
         tool_name: string;
         tool_input: Record<string, unknown>;
         tool_output?: string;
-      } = { tool_name: block.name, tool_input: toolInput };
+      } = { tool_name: call.function.name, tool_input: toolInput };
 
       const preResult = hooks.runHooks("PreToolUse", ctx);
 
       for (const msg of preResult.messages) {
         results.push({
-          type: "tool_result",
-          tool_use_id: block.id,
+          role: "tool",
+          tool_call_id: call.id,
           content: `[Hook message]: ${msg}`,
         });
       }
@@ -313,21 +304,21 @@ async function agentLoop(messages: MessageParam[], hooks: HookManager): Promise<
       if (preResult.blocked) {
         const reason = preResult.block_reason ?? "Blocked by hook";
         results.push({
-          type: "tool_result",
-          tool_use_id: block.id,
+          role: "tool",
+          tool_call_id: call.id,
           content: `Tool blocked by PreToolUse hook: ${reason}`,
         });
         continue;
       }
 
-      const handler = TOOL_HANDLERS[block.name];
+      const handler = TOOL_HANDLERS[call.function.name];
       let output: string;
       try {
-        output = handler ? handler(ctx.tool_input) : `Unknown: ${block.name}`;
+        output = handler ? handler(ctx.tool_input) : `Unknown: ${call.function.name}`;
       } catch (e) {
         output = `Error: ${e}`;
       }
-      console.log(`> ${block.name}: ${output.slice(0, 200)}`);
+      console.log(`> ${call.function.name}: ${output.slice(0, 200)}`);
 
       ctx.tool_output = output;
       const postResult = hooks.runHooks("PostToolUse", ctx);
@@ -335,10 +326,10 @@ async function agentLoop(messages: MessageParam[], hooks: HookManager): Promise<
         output += `\n[Hook note]: ${msg}`;
       }
 
-      results.push({ type: "tool_result", tool_use_id: block.id, content: String(output) });
+      results.push({ role: "tool", tool_call_id: call.id, content: String(output) });
     }
 
-    messages.push({ role: "user", content: results });
+    messages.push(...results);
   }
 }
 
@@ -346,7 +337,7 @@ async function main(): Promise<void> {
   const hooks = new HookManager();
   hooks.runHooks("SessionStart", { tool_name: "", tool_input: {} });
 
-  const history: MessageParam[] = [];
+  const history: Message[] = [];
   const rl = readline.createInterface({ input, output });
   try {
     while (true) {
